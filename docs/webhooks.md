@@ -45,7 +45,9 @@ def verify(secret: str, header: str, body: bytes, tolerance: int = 300) -> bool:
   and never changes for a given event.
 - **In order, per endpoint.** Events reach your endpoint in increasing `seq` order. Event N+1 is not sent
   until event N is acknowledged.
-- **Nothing is dropped.** Taskbox keeps retrying until it gets a 2xx.
+- **Taskbox never gives up on its own.** It keeps retrying retryable failures indefinitely. A
+  non-retryable answer pauses your endpoint instead. Events are skipped only when an operator explicitly
+  calls `skip`, or deletes the endpoint.
 
 | Your answer | What Taskbox does |
 |---|---|

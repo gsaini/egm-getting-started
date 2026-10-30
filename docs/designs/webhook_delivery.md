@@ -1,7 +1,7 @@
 # Webhook delivery for Taskbox
 
 *   **Author:** Elephant (Claude Code session), for Gopal Saini
-*   **Status:** Approved (revision 2, after Goldfish review; see [Resolution](#resolution-history))
+*   **Status:** Approved, implemented (revision 3: revision 2 plus drift fixes; see [Resolution](#resolution-history))
 *   **Date:** 2026-10-29
 
 --------------------------------------------------------------------------------
@@ -104,8 +104,8 @@ Polling `GET /tasks` already lets billing count completions per day, because eve
 *   **Given**: The chat endpoint answers `400` to the event with `seq` 41.
 *   **When**: Taskbox delivers event 41.
 *   **Then**:
-    *   The endpoint becomes `paused`, with `"paused_reason": "HTTP 400: <first 200 characters of the
-        body>"`, and a WARNING line is logged.
+    *   The endpoint becomes `paused`, with `"paused_reason": "HTTP 400: <first 200 bytes of the body,
+        decoded as UTF-8>"`, and a WARNING line is logged.
     *   No more attempts are made until an operator acts:
         *   `POST /webhooks/{id}/resume` retries event 41.
         *   `POST /webhooks/{id}/skip` moves the cursor past event 41 and resumes.
@@ -174,8 +174,9 @@ the cursor is set to the highest existing `seq`. A single `DeliveryWorker` threa
 2.  Sign the envelope and POST it, holding no lock. Each socket operation has a 10-second timeout,
     redirects are not followed, and at most 200 bytes of the response are read.
 3.  `store.record_outcome(due, outcome, error)`. Under the lock, apply one conditional UPDATE: `WHERE id
-    = ? AND cursor = <cursor from step 1> AND state = 'active'`. If an operator paused, skipped, resumed, or
-    deleted the endpoint while the POST was in flight, no row matches and the outcome is dropped. The
+    = ? AND cursor = <cursor from step 1> AND generation = <generation from step 1> AND state = 'active'`.
+    `pause`, `resume`, and `skip` each increment `generation`. So if an operator paused, skipped, resumed,
+    or deleted the endpoint while the POST was in flight, no row matches and the outcome is dropped. The
     outcome is one of:
     *   **delivered**, for a 2xx response. Set `cursor = seq`, `consecutive_failures = 0`, and both
         `last_success_at` and `next_attempt_at` to now.
@@ -215,10 +216,11 @@ second `sqlite3.connect(":memory:")` would open a different, empty database. Eac
 `self.lock` itself, and callers never hold it, because it is not reentrant. Only single-row reads and
 writes happen under it.
 
-`Store(path, clock=time.time)` is the only clock. Webhook times are stored as REAL Unix seconds, so they
-are compared as numbers. They are rendered as ISO-8601 UTC with milliseconds and `Z` only in API responses
-and envelopes. Task timestamps keep the existing `now()` format. The worker uses `store.clock()` for the
-signature `T` and for latency.
+`Store(path, clock=time.time)` is the only source of timestamps. Webhook times are stored as REAL Unix
+seconds, so they are compared as numbers. They are rendered as ISO-8601 UTC with milliseconds and `Z` only
+in API responses and envelopes. Task timestamps keep the existing `now()` format. The worker uses
+`store.clock()` for the signature `T`. Attempt latency is a duration, not a timestamp, so it is measured
+with `time.monotonic()`.
 
 ### Schema
 
@@ -233,7 +235,8 @@ It can send a CORS "simple" request (a `POST` with `text/plain`), or use DNS reb
 origin resolve to 127.0.0.1. Through `/webhooks`, either would let an attacker register a URL and receive
 every event from then on. Two checks close this:
 
-*   **Every request** must carry `Host: 127.0.0.1:<port>` or `Host: localhost:<port>`, else `421`. That
+*   **Every request** must carry `Host: 127.0.0.1:<port>` or `Host: localhost:<port>`, else `421`. This
+    applies to every HTTP method, and methods the API doesn't use answer `405` after the check. That
     defeats DNS rebinding for all routes, including reads of `/events` and `/webhooks`.
 *   **POST requests to `/webhooks…`** must have `Content-Type: application/json`, else `415`. A browser
     must send a preflight for that, and Taskbox never answers preflights. `DELETE` always triggers a
@@ -256,7 +259,8 @@ Log lines go to the `taskbox.webhooks` logger:
 
 *   INFO per attempt: `attempt webhook=<id> event=<uuid> seq=<n> attempt=<failures+1> outcome=<o>
     status=<code|-> ms=<latency>`
-*   WARNING on `paused`, `resumed`, and `skipped`, with the endpoint id and the reason
+*   WARNING on `paused` (with the endpoint id and the reason), on `resumed` (with the endpoint id), and on
+    `skipped` (with the endpoint id and the `seq` it moved to)
 
 Secrets and signatures are never logged.
 
@@ -403,7 +407,8 @@ passing. `tests/test_api.py` must pass unchanged in both.
             next_attempt_at REAL NOT NULL,
             last_attempt_at REAL,
             last_success_at REAL,
-            last_error TEXT
+            last_error TEXT,
+            generation INTEGER NOT NULL DEFAULT 0
         );
         ```
     *   Module constants:
@@ -417,7 +422,7 @@ passing. `tests/test_api.py` must pass unchanged in both.
         `last_success_at: str | None`, `last_error: str | None`. Times are rendered with `iso()`, and
         `None` stays `None`. Add `to_dict()` using `asdict`. There is no `secret` field.
     *   `@dataclass(frozen=True) class Due` has these fields: `webhook_id: int`, `url: str`,
-        `secret: str`, `cursor: int`, `failures: int`, `seq: int`, `event_id: str`, `body: str`.
+        `secret: str`, `cursor: int`, `generation: int`, `failures: int`, `seq: int`, `event_id: str`, `body: str`.
     *   Methods. Each takes `self.lock` itself.
 
         | Method | Returns | Behaviour |
@@ -426,11 +431,11 @@ passing. `tests/test_api.py` must pass unchanged in both.
         | `get_webhook(id: int)` | `Webhook \| None` | Returns the endpoint, with `lag = max(0, COALESCE(MAX(events.seq), 0) - cursor)`. |
         | `list_webhooks()` | `list[Webhook]` | Returns all endpoints, ordered by `id`. |
         | `delete_webhook(id: int)` | `bool` | Deletes the endpoint. |
-        | `pause(id: int)` | `Webhook \| None` | Sets `state = 'paused'`, `paused_reason = OPERATOR_PAUSE`. Logs WARNING `paused webhook=<id> reason=<reason>`. |
-        | `resume(id: int)` | `Webhook \| None` | Sets `state = 'active'`, `paused_reason = NULL`, `consecutive_failures = 0`, `next_attempt_at = clock()`, and keeps `last_error`. Logs WARNING `resumed webhook=<id>`. |
+        | `pause(id: int)` | `Webhook \| None` | Sets `state = 'paused'`, `paused_reason = OPERATOR_PAUSE`, and increments `generation`. Logs WARNING `paused webhook=<id> reason=<reason>`. |
+        | `resume(id: int)` | `Webhook \| None` | Sets `state = 'active'`, `paused_reason = NULL`, `consecutive_failures = 0`, `next_attempt_at = clock()`, increments `generation`, and keeps `last_error`. Logs WARNING `resumed webhook=<id>`. |
         | `skip(id: int)` | `Webhook \| None` | Returns `None` if the endpoint is missing. Raises `Conflict("webhook is not paused")` unless `state == 'paused'`. Sets `cursor = (SELECT MIN(seq) FROM events WHERE seq > cursor)`, or raises `Conflict("no pending event")` if there is none. Then applies `resume`'s changes. Logs WARNING `skipped webhook=<id> seq=<n>`. |
         | `next_due()` | `Due \| None` | `SELECT` from `webhooks` joined to the event with `MIN(seq) > cursor`, `WHERE state = 'active' AND next_attempt_at <= clock()`, `ORDER BY next_attempt_at, id LIMIT 1`. |
-        | `record_outcome(due: Due, outcome: str, error: str \| None)` | `bool` | One `UPDATE ... WHERE id = ? AND cursor = ? AND state = 'active'`, applying the Delivery step 3 fields for `outcome` (`"delivered"`, `"retry"` or `"pause"`) with `now = clock()` and `n = due.failures + 1`. Sets `last_attempt_at = now`. Returns whether a row matched. On `"pause"`, logs WARNING `paused webhook=<id> reason=<error>`. |
+        | `record_outcome(due: Due, outcome: str, error: str \| None)` | `bool` | One `UPDATE ... WHERE id = ? AND cursor = ? AND generation = ? AND state = 'active'`, applying the Delivery step 3 fields for `outcome` (`"delivered"`, `"retry"` or `"pause"`) with `now = clock()` and `n = due.failures + 1`. Sets `last_attempt_at = now`. Returns whether a row matched. On `"pause"`, logs WARNING `paused webhook=<id> reason=<error>`. |
 
 #### 2. `src/taskbox/webhooks.py` (Create, Phase 2)
 
@@ -449,13 +454,14 @@ passing. `tests/test_api.py` must pass unchanged in both.
         POSTs with that opener. It returns:
         *   on success, `(resp.status, resp.read(200).decode("utf-8", "replace"))`;
         *   on `except HTTPError as e`, `(e.code, e.read(200).decode("utf-8", "replace"))`;
-        *   on `except (URLError, OSError, TimeoutError) as e`, `(None, type(e).__name__)`.
+        *   on `except Exception as e`, `(None, type(e).__name__)`. This covers `URLError`, `OSError`, `TimeoutError`, and `http.client.InvalidURL`, so a URL that can't be sent is retried rather than raising out of `run_once`.
     *   `validate_url(url: object) -> str | None` returns `None` when the value is valid. Otherwise it
         returns:
         *   `"url must be a string"`;
         *   `"url must be at most 2000 characters"`;
         *   `"url must be an absolute http or https URL with a host"`. This one is for a scheme other than
-            http or https, or a missing hostname, as judged by `urlsplit`.
+            http or https, a missing hostname, or anything `urlsplit(url)` or its `.port` rejects with
+            `ValueError` (for example `http://h:abc/` or `http://[::1`).
     *   `class DeliveryWorker` has
         `__init__(self, store, sender: Callable[[str, bytes, dict[str, str]], tuple[int | None, str]] = send)`
         and `self._stop = threading.Event()`, `self._thread: threading.Thread | None = None`.
@@ -488,7 +494,7 @@ passing. `tests/test_api.py` must pass unchanged in both.
         query parameters are read with `parse_qs(.query)`.
     *   **Phase 1, `GET /events`**:
         *   `after` defaults to `0`.
-        *   If present, its first value must match `^\d+$`, else
+        *   If present, its first value (blank values kept, using `keep_blank_values=True`) must match `^\d{1,18}$`, else
             `400 {"error": "after must be a non-negative integer"}`.
         *   It returns `200 {"events": [...], "next_after": <seq of last event, or after if none>}`.
     *   **Phase 2**:
@@ -513,9 +519,9 @@ passing. `tests/test_api.py` must pass unchanged in both.
             with `finally:` calling `worker.stop()` if a worker exists, then `server.server_close()`.
     *   `make_server`'s signature does not change, and it never starts a worker.
 
-#### 4. `tests/test_events.py` (Create, Phase 1)
+#### 4. `tests/conftest.py` and `tests/test_events.py` (Create, Phase 1)
 
-*   **Type / Scope**: Store and `GET /events` tests.
+*   **Type / Scope**: Shared fixtures (`Clock`, `store`, `http`), plus Store and `GET /events` tests.
 *   **Proposed Changes**:
     *   Create, complete, and delete each record one event. The `type` matches, and the task in `data`
         matches what the call returned.
@@ -576,7 +582,7 @@ passing. `tests/test_api.py` must pass unchanged in both.
 
 *   **Type / Scope**: Receiver documentation, and a development receiver.
 *   **Proposed Changes**:
-    *   `docs/webhooks.md` covers the envelope, the headers, the 12-line reference verifier, and the
+    *   `docs/webhooks.md` covers the envelope, the headers, the reference verifier, and the
         delivery contract: at-least-once, de-duplicate on `id`, per-endpoint order by `seq`. It also
         covers the retry schedule and what pauses an endpoint.
     *   `scripts/receiver.py [--port 9000] [--secret S]` is a standard-library server. It answers every
@@ -593,9 +599,11 @@ passing. `tests/test_api.py` must pass unchanged in both.
     1.  Start `uv run taskbox --db /tmp/tb.db`.
     2.  Register `http://127.0.0.1:9000/` with
         `curl -s -H 'Content-Type: application/json' -d '{"url":"http://127.0.0.1:9000/"}' localhost:8000/webhooks`.
-    3.  Complete a task. Expect INFO lines with `outcome=retry status=-` at about 5 s and then 15 s.
-    4.  Start `uv run python scripts/receiver.py --port 9000`. On the next retry it prints `task.completed`,
-        and the log shows `outcome=delivered`.
+    3.  Create and complete a task. Expect INFO lines with `outcome=retry status=-` within about 1 s, then
+        5 s and 15 s later.
+    4.  Start `uv run python scripts/receiver.py --port 9000 --secret <secret>`. On the next retry it prints
+        `task.created` and then `task.completed`, both with `signature=ok`, and the log shows
+        `outcome=delivered`.
 
 --------------------------------------------------------------------------------
 
@@ -616,6 +624,9 @@ passing. `tests/test_api.py` must pass unchanged in both.
 
 *   **Revision 1** (commit `df48a8a`), reviewed by nine fresh reviewers across five stages, raised 5
     Blockers and 61 Majors before de-duplication.
+*   **Revision 3** applies the [drift report](../egm-run/06-drift/2026-10-29_DRIFT_REPORT.md) taken after
+    implementation. Code was fixed for six items, each with a test that fails on the old code, and the doc
+    was corrected for the rest.
 *   **Revision 2** applies [the resolution](../egm-run/04-resolve/goldfish_review_report.md):
     *   21 fixes;
     *   1 narrowed fix (the `Host` and Content-Type checks);

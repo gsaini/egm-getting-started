@@ -66,9 +66,17 @@ def test_signature_matches_the_reference_verifier():
     assert not verify(secret, header, body, now=1_800_000_400)  # outside the 5-minute window
 
 
-@pytest.mark.parametrize("url", ["ftp://x", "http://", "/relative", 5, "http://h/" + "a" * 2000])
-def test_validate_url_rejects(url):
-    assert validate_url(url)
+HOST_MSG = "url must be an absolute http or https URL with a host"
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [("ftp://x", HOST_MSG), ("http://", HOST_MSG), ("/relative", HOST_MSG), (5, "url must be a string"),
+     ("http://h/" + "a" * 2000, "url must be at most 2000 characters"),
+     ("http://h:abc/", HOST_MSG), ("http://h:99999/", HOST_MSG), ("http://[::1", HOST_MSG)],
+)  # fmt: skip
+def test_validate_url_rejects_with_the_specified_message(url, message):
+    assert validate_url(url) == message
 
 
 def test_validate_url_accepts():
@@ -169,10 +177,46 @@ def test_skip_moves_to_the_next_existing_seq_and_only_when_paused(store, http):
 def test_an_operator_pause_mid_send_wins(store):
     hook, _ = store.create_webhook("http://r/")
     store.create("x")
-    sender = FakeSender(store, 204, during=lambda: store.pause(hook.id))
-    DeliveryWorker(store, sender).run_once()
+    due = store.next_due()
+    store.pause(hook.id)  # what an operator does while the POST is in flight
+    assert store.record_outcome(due, "delivered", None) is False
     got = store.get_webhook(hook.id)
     assert got.state == "paused" and got.paused_reason == "paused by operator" and got.cursor == 0
+
+
+def test_a_resume_mid_send_is_not_overwritten_by_the_stale_outcome(store, clock):
+    hook, _ = store.create_webhook("http://r/")
+    store.create("x")
+    DeliveryWorker(store, FakeSender(store, 503)).run_once()  # one failure, backing off
+    clock.now += 5
+    due = store.next_due()
+    store.resume(hook.id)  # operator resets the endpoint mid-send
+    assert store.record_outcome(due, "retry", "HTTP 503: late") is False
+    got = store.get_webhook(hook.id)
+    assert got.consecutive_failures == 0 and got.last_error == "HTTP 503: reply 503"
+
+
+def test_success_after_failures_resets_the_count(store, clock):
+    hook, _ = store.create_webhook("http://r/")
+    store.create("x")
+    worker = DeliveryWorker(store, FakeSender(store, 503, 503, 204))
+    for _ in range(3):
+        worker.run_once()
+        clock.now += 60
+    got = store.get_webhook(hook.id)
+    assert got.consecutive_failures == 0 and got.cursor == 1 and got.last_success_at
+
+
+def test_a_url_the_sender_cannot_parse_is_retried_not_a_crash(store):
+    """Drift report item 1: an unparseable URL must not raise out of run_once and starve the queue."""
+    bad, _ = store.create_webhook("http://h:abc/")  # bypasses validate_url, as an old row might
+    good, _ = store.create_webhook("http://r/")
+    store.create("x")
+    worker = DeliveryWorker(store)  # the real `send`
+    assert worker.run_once()  # bad endpoint (earliest id): recorded as a retry, no exception
+    got = store.get_webhook(bad.id)
+    assert got.consecutive_failures == 1 and got.last_error == "InvalidURL"
+    assert store.next_due().webhook_id == good.id  # the other endpoint is next, not starved
 
 
 def test_record_outcome_is_dropped_when_the_endpoint_moved(store):

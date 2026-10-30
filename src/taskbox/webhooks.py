@@ -10,7 +10,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import Callable
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 
 from taskbox.store import Store, envelope
@@ -49,7 +49,7 @@ def send(url: str, body: bytes, headers: dict[str, str], timeout: float = 10.0) 
             return resp.status, resp.read(200).decode("utf-8", "replace")
     except HTTPError as e:
         return e.code, e.read(200).decode("utf-8", "replace")
-    except (URLError, OSError, TimeoutError) as e:
+    except Exception as e:  # URLError, OSError, TimeoutError, http.client.InvalidURL, ...: all retryable
         return None, type(e).__name__
 
 
@@ -58,9 +58,14 @@ def validate_url(url: object) -> str | None:
         return "url must be a string"
     if len(url) > 2000:
         return "url must be at most 2000 characters"
-    parts = urlsplit(url)
+    message = "url must be an absolute http or https URL with a host"
+    try:
+        parts = urlsplit(url)
+        parts.port  # noqa: B018 — raises ValueError for a port like ":abc" or ":99999"
+    except ValueError:
+        return message
     if parts.scheme not in ("http", "https") or not parts.hostname:
-        return "url must be an absolute http or https URL with a host"
+        return message
     return None
 
 

@@ -4,6 +4,8 @@ import json
 import sqlite3
 import uuid
 
+import pytest
+
 from taskbox.store import Store
 
 
@@ -88,11 +90,16 @@ def test_get_events_over_http(http):
     assert status == 200 and empty == {"events": [], "next_after": page["next_after"]}
 
 
-def test_bad_after_is_rejected(http):
-    assert http("GET", "/events?after=abc")[0] == 400
-    assert http("GET", "/events?after=-1")[0] == 400
+@pytest.mark.parametrize("after", ["abc", "-1", "", "9" * 19])
+def test_bad_after_is_rejected(http, after):
+    assert http("GET", f"/events?after={after}") == (400, {"error": "after must be a non-negative integer"})
 
 
-def test_foreign_host_header_is_rejected(http):
-    status, body = http("GET", "/events", headers={"Host": "evil.example"})
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE", "OPTIONS", "PUT"])
+def test_foreign_host_header_is_rejected_for_every_method(http, method):
+    status, body = http(method, "/events", headers={"Host": "evil.example"})
     assert status == 421 and body == {"error": "unexpected Host header"}
+
+
+def test_unsupported_methods_answer_405(http):
+    assert http("OPTIONS", "/webhooks") == (405, {"error": "method not allowed"})

@@ -35,7 +35,7 @@ MAX_BODY = 16_000
 MAX_TITLE = 200
 TASK_PATH = re.compile(r"^/tasks/(\d+)(/done)?$")
 WEBHOOK_PATH = re.compile(r"^/webhooks/(\d+)(?:/(pause|resume|skip))?$")
-DIGITS = re.compile(r"^\d+$")
+DIGITS = re.compile(r"^\d{1,18}$")  # fits SQLite's 64-bit integer
 
 
 def make_server(store: Store, host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
@@ -96,6 +96,13 @@ def make_server(store: Store, host: str = "127.0.0.1", port: int = 8000) -> Thre
                 return self._error(404, "task not found")
             return self._error(404, "not found")
 
+        def _unsupported(self) -> None:
+            path, _ = self._route()  # Host is checked first, for every method
+            if path is not None:
+                self._error(405, "method not allowed")
+
+        do_HEAD = do_PUT = do_PATCH = do_OPTIONS = _unsupported
+
         # --- helpers ------------------------------------------------------------------------
 
         def _route(self) -> tuple[str | None, dict[str, list[str]]]:
@@ -105,7 +112,7 @@ def make_server(store: Store, host: str = "127.0.0.1", port: int = 8000) -> Thre
                 self._error(421, "unexpected Host header")
                 return None, {}
             parts = urlsplit(self.path)
-            return parts.path, parse_qs(parts.query)
+            return parts.path, parse_qs(parts.query, keep_blank_values=True)
 
         def _post_webhooks(self, path: str) -> None:
             media = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()

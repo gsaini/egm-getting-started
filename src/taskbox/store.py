@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS webhooks (
     next_attempt_at REAL NOT NULL,
     last_attempt_at REAL,
     last_success_at REAL,
-    last_error TEXT
+    last_error TEXT,
+    generation INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -97,6 +98,7 @@ class Due:
     url: str
     secret: str
     cursor: int
+    generation: int
     failures: int
     seq: int
     event_id: str
@@ -199,7 +201,8 @@ class Store:
     def pause(self, webhook_id: int) -> Webhook | None:
         with self.lock, self.db:
             changed = self.db.execute(
-                "UPDATE webhooks SET state = 'paused', paused_reason = ? WHERE id = ?", (OPERATOR_PAUSE, webhook_id)
+                "UPDATE webhooks SET state = 'paused', paused_reason = ?, generation = generation + 1 WHERE id = ?",
+                (OPERATOR_PAUSE, webhook_id),
             ).rowcount
             if changed:
                 log.warning("paused webhook=%d reason=%s", webhook_id, OPERATOR_PAUSE)
@@ -230,7 +233,8 @@ class Store:
     def next_due(self) -> Due | None:
         with self.lock:
             row = self.db.execute(
-                "SELECT w.id, w.url, w.secret, w.cursor, w.consecutive_failures, e.seq, e.id AS event_id, e.body "
+                "SELECT w.id, w.url, w.secret, w.cursor, w.generation, w.consecutive_failures, "
+                "e.seq, e.id AS event_id, e.body "
                 "FROM webhooks w JOIN events e "
                 "  ON e.seq = (SELECT MIN(seq) FROM events WHERE seq > w.cursor) "
                 "WHERE w.state = 'active' AND w.next_attempt_at <= ? "
@@ -240,14 +244,15 @@ class Store:
             if row is None:
                 return None
             return Due(
-                row["id"], row["url"], row["secret"], row["cursor"],
+                row["id"], row["url"], row["secret"], row["cursor"], row["generation"],
                 row["consecutive_failures"], row["seq"], row["event_id"], row["body"],
             )  # fmt: skip
 
     def record_outcome(self, due: Due, outcome: str, error: str | None) -> bool:
         """Apply one attempt's outcome, only if the endpoint is still where the attempt found it.
 
-        Returns False when an operator paused, skipped, resumed or deleted the endpoint mid-send.
+        Returns False when an operator paused, skipped, resumed or deleted the endpoint mid-send: each of
+        those bumps `generation` (or removes the row), so the conditional UPDATE matches nothing.
         """
         t = self.clock()
         n = due.failures + 1
@@ -264,8 +269,8 @@ class Store:
             raise ValueError(f"unknown outcome {outcome!r}")
         with self.lock, self.db:
             matched = self.db.execute(
-                f"UPDATE webhooks SET {sets} WHERE id = ? AND cursor = ? AND state = 'active'",
-                (*params, due.webhook_id, due.cursor),
+                f"UPDATE webhooks SET {sets} WHERE id = ? AND cursor = ? AND generation = ? AND state = 'active'",
+                (*params, due.webhook_id, due.cursor, due.generation),
             ).rowcount == 1  # fmt: skip
         if matched and outcome == "pause":
             log.warning("paused webhook=%d reason=%s", due.webhook_id, error)
@@ -275,7 +280,7 @@ class Store:
         return (
             self.db.execute(
                 "UPDATE webhooks SET state = 'active', paused_reason = NULL, consecutive_failures = 0, "
-                "next_attempt_at = ? WHERE id = ?",
+                "next_attempt_at = ?, generation = generation + 1 WHERE id = ?",
                 (self.clock(), webhook_id),
             ).rowcount
             == 1
