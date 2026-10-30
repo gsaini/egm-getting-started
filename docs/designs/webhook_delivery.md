@@ -1,428 +1,625 @@
 # Webhook delivery for Taskbox
 
 *   **Author:** Elephant (Claude Code session), for Gopal Saini
-*   **Status:** In Review
+*   **Status:** Approved (revision 2, after Goldfish review; see [Resolution](#resolution-history))
 *   **Date:** 2026-10-29
 
 --------------------------------------------------------------------------------
 
 ## Overview
 
-Taskbox is a small task API: one Python process (standard library only) serving HTTP in front of one
-SQLite file (`src/taskbox/server.py`, `src/taskbox/store.py`). This design adds an **event log** and
-**webhook delivery**, so that two internal systems hear when tasks are created, completed, or deleted:
+Taskbox is a task API: one Python process (standard library only) serving HTTP in front of one SQLite
+file ([`store.py`](../../src/taskbox/store.py), [`server.py`](../../src/taskbox/server.py)). This design
+adds an **event log** and **webhook delivery** so that two internal systems hear when tasks are created,
+completed, or deleted: a **chat integration** that posts when a task is done, and a **billing system** that
+counts completed tasks per day.
 
-*   a **chat integration** that posts a message when a task is done, and
-*   a **billing system** that counts completed tasks per day.
+Billing must never miss a completion and must never see one completion as two. No new processes,
+services, or third-party packages may be added.
 
-Billing must never lose an event. Chat tolerates a rare duplicate. No new processes, services, or
-third-party packages may be added.
+The design follows a [concept brief](../egm-run/01-brainstorm/concepts_brief.md) that six reviewers
+critiqued. Revision 2 applies the findings of a five-stage review
+([consolidated report](../egm-run/03-review/consolidated_review_report.md)). (EGM, the
+Elephant-Goldfish Model, is the process used: one long-running session drafts, and reviewers that have
+seen none of that conversation critique.)
 
-The design comes from a concept brief that six independent reviewers stress-tested
-([concepts_brief.md](../egm-run/01-brainstorm/concepts_brief.md)).
+## Problem Statement
 
-## The Problem
+Polling `GET /tasks` already lets billing count completions per day, because every task has
+`completed_at`. Polling has two gaps:
 
-Today nothing outside Taskbox can learn that a task changed except by polling `GET /tasks` and diffing.
-Diffing cannot see deletions reliably, and it cannot tell a task completed today from one completed
-yesterday without storing state of its own.
-
-The proposed solution has three parts:
-
-1.  **Record an event in the same database transaction as every real task change.**
-2.  **Let receivers read the event log**, either by pulling `GET /events?after=` or by being pushed to.
-3.  **Push events to registered endpoints** in order, signed, retrying until delivered, and never discarding an event.
+*   **Deletions are invisible.** A task that is completed and then deleted disappears from `GET /tasks`, so
+    billing never counts it.
+*   **There is no push.** The chat integration would have to poll and diff to notice a completion.
 
 ## Goals
 
-*   Every task change that actually changes state records exactly one event, in the same SQLite
-    transaction as the change. Calls that change nothing (a second `POST /tasks/{id}/done`, a `DELETE` of a
-    missing task) record no event.
-*   An event, once recorded, is never discarded by delivery logic. It reaches every endpoint that existed
-    when it was recorded, unless an operator deletes the endpoint or explicitly skips that event.
-*   A receiver that comes back after a 24-hour outage receives everything it missed, in order, without
-    operator action. (A non-retryable error pauses the endpoint instead; see CUJ 3.)
-*   The time from a task change to delivery is under 60 seconds while the receiver is healthy.
-*   API latency is unaffected by receivers. No network I/O happens while the store lock is held.
-*   An operator can see, through the API alone, whether each endpoint is healthy, how far behind it is, and
-    what its last error was.
+*   Each create, first completion, and delete of an existing task records exactly one event, in the same
+    SQLite transaction as the change. Calls that change nothing record no event: a second
+    `POST /tasks/{id}/done`, or a `DELETE` of a missing task.
+*   **No duplicate events.** One change produces one event, with one `id`. **Repeat deliveries are
+    allowed.** The same event can be delivered more than once (at-least-once), and receivers de-duplicate
+    on `id`.
+*   Delivery logic never discards an event. An event reaches every endpoint that existed when it was
+    recorded. The exceptions are an operator deleting the endpoint or explicitly skipping the event (CUJ 4).
+*   A receiver that returns after a 24-hour outage receives everything it missed, in order, without
+    operator action. The first catch-up attempt comes within 30 minutes of recovery, and the rest follow
+    back to back.
+*   While an endpoint is healthy, an event is delivered within 60 seconds. "Healthy" means
+    `state = "active"`, `consecutive_failures = 0`, and the receiver answers 2xx within the timeout.
+*   No network I/O happens while `store.lock` is held. The tests check this on every send.
+*   An operator can see, through the API, each endpoint's state, lag, failures, and last error.
 
 ## Non-Goals
 
-*   **Per-endpoint event filters.** Every endpoint receives all three event types.
-*   **Authentication on the API.** Taskbox binds to 127.0.0.1, and endpoint registration inherits that
-    posture. Auth is required before the bind address changes. That work is separate from this design.
-*   **Secret rotation with two live secrets.** Rotation is: pause, delete, re-create, resume.
-*   **Retention and pruning of old events.** See Future Improvements.
-*   **Backfilling events for changes made before this feature shipped.**
-*   **Parallel delivery, metrics export, and distributed tracing.**
+*   Per-endpoint event filters. Every endpoint receives all three event types.
+*   Authentication on the API. See [Threat model](#threat-model) for what replaces it here.
+*   Secret rotation with two live secrets. See [Operating it](#operating-it) for the procedure that uses
+    existing routes.
+*   Retention or pruning of old events. Schema versioning (`PRAGMA user_version`) is also out until a
+    column must change.
+*   Backfilling events for changes made before this feature shipped, parallel delivery, metrics export,
+    and distributed tracing.
 
 ## Open Questions
 
-*   **Backoff schedule.** The proposed schedule is 5 s, 15 s, 1 min, 5 min, 15 min, then every 30 min.
-    Billing should confirm that 30 minutes is an acceptable worst-case delay after its own recovery.
+*   **For billing:** is 30 minutes an acceptable worst-case delay before the first catch-up attempt after
+    an outage? That is the backoff cap.
+*   **For billing and chat:** delivery to an endpoint is strictly in order. An event the receiver rejects
+    permanently pauses that endpoint until an operator acts, which is head-of-line blocking by design. Is
+    a pause, visible on the API and in the logs, acceptable, given that there is no paging?
 
 ## Critical User Journeys (CUJs)
 
-### CUJ 1: Billing receives a completion
-
-*   **Given**: Billing's endpoint is registered and active, and billing returns `204` to valid requests.
-*   **When**: A user calls `POST /tasks/7/done` on a task that was not done.
-*   **Then**: The response is the same `200` as today. Within 60 seconds billing receives one `POST`.
-    The JSON body has `"type": "task.completed"`, a stable `id`, and the task with `"done": true`. It carries
-    a `Taskbox-Signature` header that billing verifies with its secret. Calling `POST /tasks/7/done` again
-    returns `200` and sends nothing.
-
-### CUJ 2: Billing is down for a day and catches up
-
-*   **Given**: Billing's endpoint has been returning `503` or refusing connections for 24 hours, and 300
-    events have been recorded meanwhile.
-*   **When**: Billing comes back.
-*   **Then**: Within 30 minutes of recovery, Taskbox sends the 300 events in sequence order. During the
-    outage, `GET /webhooks/{id}` showed `"state": "active"` with a growing `"lag"` and a rising
-    `"consecutive_failures"`, and the API stayed fast throughout. Nothing was discarded.
-
-### CUJ 3: A receiver rejects an event permanently
-
-*   **Given**: The chat endpoint answers `400 Bad Request` to the event with sequence 41.
-*   **When**: Taskbox delivers event 41.
-*   **Then**: The endpoint's state becomes `paused`, with `"paused_reason"` holding the status and the
-    start of the response body. No more attempts are made, and a WARNING line is logged. The operator fixes
-    the receiver and calls `POST /webhooks/{id}/resume`, which retries event 41. Alternatively the operator
-    calls `POST /webhooks/{id}/skip`, which moves the cursor past event 41 and resumes. Either way the
-    endpoint's later events are not lost.
-
-### CUJ 4: Billing reconciles by pulling
-
-*   **Given**: Billing last processed the event with sequence 1200.
-*   **When**: Billing calls `GET /events?after=1200`.
-*   **Then**: Taskbox returns at most 100 events with sequence greater than 1200, in order, plus
-    `"next_after"` for the following page. These are the same envelopes that webhooks deliver.
-
-### CUJ 5: An operator registers an endpoint
+### CUJ 1: An operator registers an endpoint
 
 *   **Given**: The operator has a receiver URL.
-*   **When**: The operator calls `POST /webhooks` with `{"url": "https://chat.internal/taskbox"}`.
-*   **Then**: Taskbox returns `201` with the endpoint, including a generated `"secret"`, shown this one
-    time only. Its cursor starts at the latest existing event, so it does not receive history. Later
-    `GET /webhooks/{id}` responses never include the secret.
+*   **When**: The operator sends `POST /webhooks` with `Content-Type: application/json` and
+    `{"url": "https://chat.internal/taskbox"}`.
+*   **Then**: Taskbox returns `201` with the endpoint plus a generated `"secret"`. The secret appears only
+    in this response. The endpoint's cursor starts at the latest existing event, so it receives no history.
+    `GET /webhooks/{id}` never includes the secret.
+
+### CUJ 2: Billing receives a completion
+
+*   **Given**: Billing's endpoint is registered and healthy.
+*   **When**: A user calls `POST /tasks/7/done` on a task that was not done.
+*   **Then**: The response is the same `200` as today. Within 60 seconds billing receives one `POST`:
+    *   The body has `"type": "task.completed"` and the task with `"done": true`.
+    *   It carries a `Taskbox-Signature` header, which billing verifies.
+    *   A second `POST /tasks/7/done` returns `200` and records no event.
+
+### CUJ 3: Billing is down for a day and catches up
+
+*   **Given**: For 24 hours, billing's endpoint has answered `503` or refused connections, and 300 events
+    were recorded during that time.
+*   **When**: Billing comes back.
+*   **Then**: Within 30 minutes Taskbox makes its next attempt. That attempt succeeds, and the remaining
+    299 events follow in `seq` order with no waiting between them. Throughout the outage, `GET /webhooks/{id}`
+    showed `"state": "active"`, a growing `"lag"`, and a rising `"consecutive_failures"`. Nothing was
+    discarded.
+
+### CUJ 4: A receiver rejects an event permanently
+
+*   **Given**: The chat endpoint answers `400` to the event with `seq` 41.
+*   **When**: Taskbox delivers event 41.
+*   **Then**:
+    *   The endpoint becomes `paused`, with `"paused_reason": "HTTP 400: <first 200 characters of the
+        body>"`, and a WARNING line is logged.
+    *   No more attempts are made until an operator acts:
+        *   `POST /webhooks/{id}/resume` retries event 41.
+        *   `POST /webhooks/{id}/skip` moves the cursor past event 41 and resumes.
+    *   `skip` is refused with `409` unless the endpoint is paused.
+
+### CUJ 5: Billing reconciles by pulling
+
+*   **Given**: Billing last processed `seq` 1200.
+*   **When**: Billing calls `GET /events?after=1200`.
+*   **Then**: Taskbox returns up to 100 events with `seq > 1200`, in order, plus `"next_after"`. The events
+    are the same envelopes webhooks deliver. `GET /events?after=0` starts from the first event ever
+    recorded, which marks where the stream begins.
 
 ## Technical Plan (Architecture)
 
 ```text
- HTTP handler ──► Store.complete(id) ──────────────────────────────┐ one transaction
-                    UPDATE tasks ... WHERE done = 0                │  (store.lock + COMMIT)
-                    if rowcount == 1: INSERT INTO events (...)  ───┘
+ HTTP handler ──► Store.complete(id) ─────────────────────────────┐ one transaction
+                    UPDATE tasks ... WHERE done = 0               │  (store.lock + COMMIT)
+                    if rowcount == 1: INSERT INTO events (...) ───┘
                           │
-                          ▼
-                 events (append-only log)  ◄──── GET /events?after=N  (pull)
+                 events (append-only)  ◄──── GET /events?after=N   (pull)
                           ▲
-                          │ reads: next event after cursor (under lock, then releases)
- DeliveryWorker (1 thread) ─► POST to endpoint (no lock held) ─► record outcome (under lock)
+   DeliveryWorker ── next_due() (lock) ─► POST, no lock held ─► record_outcome() (lock, conditional)
                           │
                  webhooks (url, secret, cursor, state, failures, next_attempt_at, ...)
 ```
 
-**Events are an outbox.** `Store.create`, `complete`, and `delete` each insert the event row inside the
-same `with self.lock, self.db:` block that changes the task. That block is a single SQLite transaction.
-They insert only when the change took effect (`rowcount == 1`). For deletes, the task row is read inside the
-transaction before it is deleted, so the event carries the task as it was. Handlers never write events.
+### Event outbox
 
-**Identity and order.** Each event has two identifiers:
+`Store.create`, `complete`, and `delete` each insert the event row inside the same
+`with self.lock, self.db:` block that changes the task. That block is a single SQLite transaction, so the
+task change and its event commit together or not at all. An event is inserted only when the change took
+effect (`rowcount == 1`). For deletes, the row is read inside the transaction before it is deleted, so the
+event carries the task as it was. HTTP handlers never write events.
 
-*   `id`, a UUID4 string created at insert. Receivers de-duplicate on it. It stays stable across retries
-    and restarts, and it is never reused, even if the database file is restored from an old backup.
-*   `seq`, the SQLite `INTEGER PRIMARY KEY`. It gives the order and backs cursors and `?after=`.
+### Identity, order, and the envelope
 
-**Envelope.** Every delivered and pulled event has this shape:
+Each event has two identifiers:
+
+*   `id` is a UUID4 created at insert time. Receivers de-duplicate on it. It is random, so a restored backup
+    does not reissue ids.
+*   `seq` is the SQLite `INTEGER PRIMARY KEY`. It orders events and is what cursors and `?after=` use.
+
+Every pulled and delivered event has this envelope:
 
 ```json
-{"id": "9b2…", "seq": 42, "type": "task.completed", "version": 1,
- "occurred_at": "2026-10-29T14:03:07.120Z", "data": {"task": {"id": 7, "title": "...", "done": true,
- "created_at": "...", "completed_at": "..."}}}
+{"id": "6f1c0b8e-3a9b-4d4e-9a57-0d6f3f2b9c11", "seq": 42, "type": "task.completed", "version": 1,
+ "occurred_at": "2026-10-29T14:03:07.120Z",
+ "data": {"task": {"id": 7, "title": "ship it", "done": true,
+                   "created_at": "2026-10-29T13:50:01+00:00", "completed_at": "2026-10-29T14:03:07+00:00"}}}
 ```
 
-The whole envelope is serialized once, at insert time, and stored as text in `events.body`. It is never
-rebuilt at send time, so later schema changes to `tasks` don't change what an old event says. Within
-`version: 1`, fields may only be added.
+The envelope, minus `seq`, is serialized once when the event is inserted and stored as `events.body`.
+`seq` belongs to the row. It is added in front of the other fields when the event is read, so stored
+content never changes after insert. The envelope's `version` describes this JSON shape. It is unrelated to
+any database version. Within version 1, fields may only be added.
 
-**Delivery.** Each webhook endpoint row has a `cursor`: the `seq` of the last event it acknowledged. It is
-set to the current maximum `seq` when the endpoint is created. One `DeliveryWorker` thread loops:
+### Delivery
 
-1.  Under the store lock, find the endpoint that is due for an attempt: the one with the earliest
-    `next_attempt_at` among those that are `active`, have `next_attempt_at <= now`, and have a pending
-    event (one whose `seq` is greater than their `cursor`). Read that pending event. Release the lock.
-2.  Sign and POST the stored body to the endpoint's URL, with a 10-second timeout and no redirects.
-3.  Under the lock, record the outcome:
-    *   **2xx**: advance `cursor` to the event's `seq`, reset failures, set `last_success_at`, and make the
-        endpoint due again immediately.
-    *   **408, 429, 5xx, timeout, connection error**: increment `consecutive_failures`, store `last_error`,
-        and set `next_attempt_at = now + backoff(consecutive_failures)`.
-    *   **Any other status** (including 3xx, since redirects are not followed): set `state = 'paused'`
-        and store `paused_reason`.
-4.  If nothing is due, sleep until the earliest `next_attempt_at`, but no longer than 1 second.
+Each endpoint has a `cursor`, the `seq` of the last event it acknowledged. When the endpoint is created,
+the cursor is set to the highest existing `seq`. A single `DeliveryWorker` thread repeats these steps:
 
-The backoff is 5 s, 15 s, 60 s, 300 s, 900 s, then 1800 s for every later failure. It never gives up.
-Because one endpoint is handled at a time and each attempt is capped at 10 s, a failing endpoint delays the
-others by at most 10 s per attempt. Its own backoff spaces those attempts out.
+1.  `store.next_due()`. Under the lock, find the active endpoint with the earliest `next_attempt_at` that
+    is `<= now` and has an event with `seq > cursor`. Return that endpoint, its cursor and failure count,
+    and the oldest such event. Then release the lock.
+2.  Sign the envelope and POST it, holding no lock. Each socket operation has a 10-second timeout,
+    redirects are not followed, and at most 200 bytes of the response are read.
+3.  `store.record_outcome(due, outcome, error)`. Under the lock, apply one conditional UPDATE: `WHERE id
+    = ? AND cursor = <cursor from step 1> AND state = 'active'`. If an operator paused, skipped, resumed, or
+    deleted the endpoint while the POST was in flight, no row matches and the outcome is dropped. The
+    outcome is one of:
+    *   **delivered**, for a 2xx response. Set `cursor = seq`, `consecutive_failures = 0`, and both
+        `last_success_at` and `next_attempt_at` to now.
+    *   **retry**, for no response (timeout, connection error, DNS failure) or a 408, 429, or 5xx.
+        Increment `consecutive_failures` to n. Set `last_error`, and set `next_attempt_at = now +
+        BACKOFF[min(n, 6) - 1]`.
+    *   **pause**, for any other status, including 3xx. Set `state = 'paused'`, put the error in both
+        `paused_reason` and `last_error`, and increment `consecutive_failures`.
+4.  If step 1 found nothing, wait 1 second, waking early if `stop()` is called. If a step raised an
+    exception, log it at ERROR and continue. The thread does not exit on an error.
 
-**Delivery is at-least-once.** If the process dies after a receiver accepted a POST but before the cursor
-advanced, that event is sent again after restart. Receivers de-duplicate on `id`.
+`BACKOFF = (5, 15, 60, 300, 900, 1800)`, in seconds. Retries go on indefinitely, and no event reaches a
+terminal failure state. Only one endpoint is handled at a time, so a failing endpoint delays the others
+by one attempt each time it comes due.
 
-**Signing.** `Taskbox-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, f"{t}.{body}")>`. Two more
-headers go with it: `Taskbox-Event-Id: <id>` and `Content-Type: application/json`. Receivers should reject a
-`t` more than 5 minutes old. The secret is 32 random bytes from `secrets.token_hex(32)`. It is returned only
-in the `201` response that creates the endpoint.
+Delivery is at-least-once. Suppose the process dies after a receiver accepted a POST but before step 3.
+That event is sent again after restart, and the receiver de-duplicates on `id`.
 
-**Locking.** The worker shares the Store's single connection and lock. That keeps `Store(":memory:")`
-working in tests, because a second `sqlite3.connect(":memory:")` would open a different, empty database.
-The lock is held only for the read in step 1 and the write in step 3, never during the POST.
+### Signing
 
-**Schema versioning.** `PRAGMA user_version` records the schema version. `Store.__init__` applies ordered,
-additive migrations: version 1 is today's `tasks` table, and version 2 adds `events` and `webhooks`. A
-database written by an older Taskbox is upgraded on start.
+Each request carries three headers:
 
-**Operating it.**
+*   `Taskbox-Signature: t=<T>,v1=<hex>`
+*   `Taskbox-Event-Id: <id>`
+*   `Content-Type: application/json`
 
-*   `GET /webhooks/{id}` shows `state`, `cursor`, `lag` (events after the cursor), `consecutive_failures`,
-    `last_error`, `last_attempt_at`, `last_success_at`, and `paused_reason`.
-*   Every attempt logs one line with `logging.getLogger("taskbox.webhooks")`, using these fields: endpoint
-    id, event id, seq, attempt number, outcome, HTTP status or exception class, and latency in ms. State
-    changes (paused, resumed, skipped) log at WARNING. Secrets and signatures are never logged.
-*   Kill switch: `taskbox --no-webhooks` records events but starts no worker. Rollback means pausing
-    endpoints or restarting with `--no-webhooks`, not downgrading the binary.
+`T` is the integer Unix time of **this attempt**, not of the event. The signature is
+`hex(HMAC-SHA256(key = secret.encode("ascii"), msg = f"{T}.".encode("ascii") + body))`, where `body` is the
+exact UTF-8 bytes of the request body. Receivers must verify against the raw body and should reject a `T`
+more than 5 minutes from their clock. The secret is `secrets.token_hex(32)`, and the hex string itself is
+the key. [`docs/webhooks.md`](../webhooks.md) holds the reference verifier.
+
+### Locking and time
+
+The worker shares the Store's single connection and lock. That keeps `Store(":memory:")` working; a
+second `sqlite3.connect(":memory:")` would open a different, empty database. Each Store method takes
+`self.lock` itself, and callers never hold it, because it is not reentrant. Only single-row reads and
+writes happen under it.
+
+`Store(path, clock=time.time)` is the only clock. Webhook times are stored as REAL Unix seconds, so they
+are compared as numbers. They are rendered as ISO-8601 UTC with milliseconds and `Z` only in API responses
+and envelopes. Task timestamps keep the existing `now()` format. The worker uses `store.clock()` for the
+signature `T` and for latency.
+
+### Schema
+
+The existing `SCHEMA` already uses `CREATE TABLE IF NOT EXISTS`. Two more statements in that style are
+appended to it, so starting the new version on an existing database file creates the new tables and
+leaves `tasks` untouched. No versioning mechanism is added.
+
+### Threat model
+
+Taskbox binds to 127.0.0.1 and has no authentication. A web page the operator visits can still reach it.
+It can send a CORS "simple" request (a `POST` with `text/plain`), or use DNS rebinding to make its own
+origin resolve to 127.0.0.1. Through `/webhooks`, either would let an attacker register a URL and receive
+every event from then on. Two checks close this:
+
+*   **Every request** must carry `Host: 127.0.0.1:<port>` or `Host: localhost:<port>`, else `421`. That
+    defeats DNS rebinding for all routes, including reads of `/events` and `/webhooks`.
+*   **POST requests to `/webhooks…`** must have `Content-Type: application/json`, else `415`. A browser
+    must send a preflight for that, and Taskbox never answers preflights. `DELETE` always triggers a
+    preflight.
+
+The existing `/tasks` routes keep their current behaviour. Their tests send form-encoded requests, and
+tightening them is out of scope (see [Risks](#risks--mitigations)).
+
+### Operating it
+
+`GET /webhooks/{id}` shows:
+
+*   `state` and `paused_reason`
+*   `cursor`, and `lag = MAX(seq) - cursor`
+*   `consecutive_failures` and `last_error`
+*   `last_attempt_at` and `last_success_at`
+*   `next_attempt_at`
+
+Log lines go to the `taskbox.webhooks` logger:
+
+*   INFO per attempt: `attempt webhook=<id> event=<uuid> seq=<n> attempt=<failures+1> outcome=<o>
+    status=<code|-> ms=<latency>`
+*   WARNING on `paused`, `resumed`, and `skipped`, with the endpoint id and the reason
+
+Secrets and signatures are never logged.
+
+**Delivery is on by default.** `taskbox --no-webhooks` still records events but does not start the
+worker.
+
+**Rollback** means pausing endpoints, or restarting with `--no-webhooks`. Events keep being recorded, so
+nothing is lost. Downgrading the binary is not a rollback. It records no events while it runs, and
+billing would have to reconcile that gap from `tasks.completed_at`. A task completed and then deleted
+during the gap cannot be recovered that way.
+
+**Rotating a secret** uses existing routes:
+
+1.  Note the old endpoint's `cursor`.
+2.  `POST /webhooks` with the same URL to get a new secret. Note the new endpoint's starting `cursor`.
+3.  The receiver pulls `GET /events?after=<old cursor>` up to the new starting cursor to cover the gap.
+4.  `DELETE` the old endpoint.
 
 ## Alternatives Considered
 
-### Alternative A: A delivery row per (event, endpoint), with leases and a terminal "failed" state
+### Alternative A: One delivery row per (event, endpoint), with leases and a terminal "failed" state
 
-*   **Pros**: Endpoints can deliver out of order, so one bad event never blocks later ones. Each attempt
-    is recorded as its own row.
-*   **Cons**: Needs a state machine (pending, in_flight, delivered, failed), lease recovery after crashes,
-    and a claim index. "Failed" means an event can be given up on, which billing's requirement forbids.
-*   **Reason for Rejection**: For two receivers, a per-endpoint cursor gives the same guarantees with one
-    integer per endpoint. The blocking risk is handled by pausing visibly and letting an operator skip.
+*   **Pros**: Out-of-order delivery, so an event a receiver rejects doesn't block the ones after it.
+*   **Cons**: Needs a state machine, lease recovery, and a claim index. "Failed" means giving up on an
+    event, which billing forbids.
+*   **Reason for Rejection**: A per-endpoint cursor gives billing the no-loss and ordering guarantees it
+    needs, using one integer per endpoint. The blocking risk is handled by a visible pause and an explicit
+    operator skip.
 
 ### Alternative B: Pull only (`GET /events?after=`), no push
 
-*   **Pros**: No retries, no signing, no worker thread, and no event can be lost.
-*   **Cons**: The chat integration would have to poll, and the request was for webhooks.
-*   **Reason for Rejection**: Kept as a second path (CUJ 4), not as the only one.
+*   **Pros**: No retries, no signing, no worker thread, and delivery logic cannot drop an event.
+*   **Cons**: Chat would have to poll, and the request was for webhooks.
+*   **Disposition**: Rejected as the only mechanism, and kept as a second path (CUJ 5).
 
-### Alternative C: Emit events from the HTTP handlers after the store call returns
+### Alternative C: Emit events from the HTTP handlers
 
-*   **Pros**: Smallest change to `store.py`.
-*   **Cons**: A crash between the two commits loses the event. A second `/done` emits a duplicate, because
+*   **Pros**: The smallest change to `store.py`.
+*   **Cons**: A crash between two commits loses the event. A second `/done` emits a second event, because
     `Store.complete` returns the task whether or not anything changed.
-*   **Reason for Rejection**: Breaks both of billing's requirements.
+*   **Reason for Rejection**: It breaks both of billing's requirements.
 
-### Alternative D: A second SQLite connection (WAL mode) for the worker
+### Alternative D: A second SQLite connection (WAL) for the worker
 
 *   **Pros**: The worker never contends with the API for the Python lock.
-*   **Cons**: Breaks `Store(":memory:")`, which every test uses. It also adds WAL configuration to a file
-    that is otherwise default.
-*   **Reason for Rejection**: Short lock holds on the shared connection meet the latency goal.
+*   **Cons**: It breaks `Store(":memory:")`, which every test uses.
+*   **Reason for Rejection**: The lock is only ever held for single-row statements, and the test suite
+    asserts it is never held during a send.
+
+### Alternative E: A schema-migration framework (`PRAGMA user_version`)
+
+*   **Pros**: It is ready for future column changes.
+*   **Cons**: This change only adds tables, which `CREATE TABLE IF NOT EXISTS` already handles. Review also
+    found four ways the proposed runner could leave a database unable to start.
+*   **Reason for Rejection**: Introduce it the first time a column must change.
+
+## Risks & Mitigations
+
+| Risk | Impact | Mitigation / acceptance |
+|---|---|---|
+| Cross-site registration, either by a browser "simple" request or by DNS rebinding | An attacker receives every event | **Mitigated:** `Host` check on all routes; JSON-only POSTs to `/webhooks` ([Threat model](#threat-model)) |
+| An operator action races with an in-flight send | An event is skipped or a pause is overwritten | **Mitigated:** conditional `record_outcome`; `skip` only while paused; tested |
+| The worker thread hits an unexpected error | Delivery stops silently | **Mitigated:** catch-all per iteration, logged at ERROR; tested |
+| An event the receiver rejects blocks its endpoint (head-of-line) | That endpoint stops receiving until an operator acts | **Accepted:** the pause is visible and logged, and `skip` is explicit (Open Question) |
+| A slow receiver or DNS resolution exceeds the 10-second timeout | Other endpoints are delayed longer than 10 s | **Accepted:** the timeout applies per socket operation, DNS is unbounded, the response read is capped at 200 bytes |
+| The backoff cap means up to 30 minutes before the first attempt after a recovery | Delay | **Accepted** (Open Question) |
+| The disk is full or SQLite fails | The task write fails too, because the event insert is in the same transaction | **Accepted:** this is the outbox's purpose; a change never commits without its event |
+| The `events` table grows without limit (about 0.4 GB/year at an assumed 3,000 events/day) | Disk use | **Accepted** for v1; retention is in Future Improvements |
+| A database backup is restored | Events recorded after the backup are lost, and `seq` restarts below values receivers have seen | **Accepted:** pullers reset their cursor, and receivers keep de-duplicating on `id` |
+| Secrets are stored in plaintext in SQLite; receivers may use plain `http` | The secret is exposed to anyone who can read the file; event contents travel unencrypted | **Accepted** for internal receivers. Secrets are never returned after creation and never logged |
+| A deleted task's data stays in `events` | A user's `DELETE` no longer erases the task's content | **Accepted** for v1; retention would bound it |
 
 --------------------------------------------------------------------------------
 
 ## Non-Functional Requirements
 
-*   **Security & Privacy**:
-    *   Registration has no auth. That matches the existing API, which binds to 127.0.0.1.
-    *   URLs must be `http` or `https` with a host. Redirects are not followed, which limits where a
-        request can be steered.
-    *   Secrets are stored in plaintext in the SQLite file, the same as task data. They are returned once,
-        never logged, and never serialized by the read endpoints.
-*   **Performance & Latency**:
-    *   API requests add one INSERT inside an existing transaction.
-    *   The worker holds the lock only for single-row reads and writes.
-    *   Each event stores about 400 bytes; at 3,000 events per day that is roughly 0.4 GB per year.
-*   **Rollout & Rollback**:
-    *   Phase 1 ships the migration and event recording with no worker.
-    *   Phase 2 adds delivery behind `--no-webhooks`.
-    *   Rollback is to pause endpoints. Downgrading the binary creates a gap with no events, which billing
-        must reconcile from `tasks.completed_at`.
-
---------------------------------------------------------------------------------
-
-### Additional Resources
-
-*   [Concepts brief](../egm-run/01-brainstorm/concepts_brief.md) and the six [brainstorm reports](../egm-run/01-brainstorm/goldfish/)
-*   `src/taskbox/store.py`, `src/taskbox/server.py`, `tests/test_api.py`
-
-### Future Improvements
-
-*   **Retention**: delete events that every endpoint has acknowledged and that are older than N days.
-*   **Rotation**: two live secrets per endpoint, with a signature for each.
-*   **Parallel delivery** if more than a handful of endpoints appear.
+*   **Security & Privacy**: [Threat model](#threat-model) and [Risks](#risks--mitigations).
+*   **Performance & Latency**: Each API write adds one INSERT inside its existing transaction. The worker
+    holds the lock only for one SELECT, or one UPDATE, at a time.
+*   **Rollout & Rollback**: Phase 1 ships event recording and `GET /events`. Phase 2 adds delivery, which
+    is on by default. For rollback, see [Operating it](#operating-it).
 
 --------------------------------------------------------------------------------
 
 ## Detailed Implementation Plan
 
-Two phases, each leaving the codebase passing `ruff check`, `ruff format --check`, and `pytest`.
+Two phases. Each one leaves `uv run ruff check .`, `uv run ruff format --check .`, and `uv run pytest -q`
+passing. `tests/test_api.py` must pass unchanged in both.
 
 ### Target Files to Create/Modify
 
-#### 1. `src/taskbox/store.py` (Modify) — Phase 1
+#### 1. `src/taskbox/store.py` (Modify)
 
-*   **Type / Scope**: Python module: schema, migrations, event outbox, webhook persistence.
-*   **Proposed Changes**:
-    *   Replace `SCHEMA` with `MIGRATIONS: list[str]`. Index 0 is today's `CREATE TABLE tasks ...`. Index
-        1 creates the two tables below. `Store.__init__` reads `PRAGMA user_version`, runs each migration
-        whose index is at or above that version (each one inside `with self.db:`), and sets
-        `PRAGMA user_version` to `len(MIGRATIONS)`.
+*   **Type / Scope**: Python module covering schema, the event outbox, and webhook persistence.
+*   **Proposed Changes, Phase 1**:
+    *   Append this to `SCHEMA`:
 
         ```sql
-        CREATE TABLE events (
+        CREATE TABLE IF NOT EXISTS events (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
             id TEXT NOT NULL UNIQUE,
-            type TEXT NOT NULL,
-            occurred_at TEXT NOT NULL,
             body TEXT NOT NULL
         );
-        CREATE TABLE webhooks (
+        ```
+    *   `Store.__init__(self, path=":memory:", clock: Callable[[], float] = time.time)` stores
+        `self.clock`. Import `Callable` from `collections.abc`.
+    *   `iso(ts: float) -> str` returns
+        `datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(ts * 1000) % 1000:03d}Z"`.
+    *   `_record(self, type_: str, task: Task) -> None` is called only inside an open transaction. It does
+        the following:
+        *   builds `{"id": str(uuid.uuid4()), "type": type_, "version": 1,
+            "occurred_at": iso(self.clock()), "data": {"task": task.to_dict()}}`;
+        *   serializes it with `json.dumps(..., separators=(",", ":"))`;
+        *   runs `INSERT INTO events (id, body) VALUES (?, ?)`.
+    *   `create` keeps the task returned by `_get(cur.lastrowid)`, calls `_record("task.created", task)`,
+        and returns the task.
+    *   `complete` keeps `cur = self.db.execute(UPDATE ...)`, and then:
+        *   reads `task = self._get(task_id)`;
+        *   if `cur.rowcount == 1`, calls `_record("task.completed", task)`;
+        *   returns `task`.
+    *   `delete` does the following:
+        *   reads `task = self._get(task_id)`;
+        *   returns `False` if `task` is `None`;
+        *   otherwise runs the `DELETE`, calls `_record("task.deleted", task)`, and returns `True`.
+    *   `envelope(seq: int, body: str) -> dict` is a module-level function. It returns
+        `{"id": d["id"], "seq": seq, **{k: v for k, v in d.items() if k != "id"}}`, where
+        `d = json.loads(body)`.
+    *   `events_after(self, after: int, limit: int = 100) -> list[dict]` runs
+        `SELECT seq, body FROM events WHERE seq > ? ORDER BY seq LIMIT ?` and maps each row through
+        `envelope`.
+*   **Proposed Changes, Phase 2**:
+    *   Append this to `SCHEMA`:
+
+        ```sql
+        CREATE TABLE IF NOT EXISTS webhooks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT NOT NULL,
             secret TEXT NOT NULL,
-            created_at TEXT NOT NULL,
+            created_at REAL NOT NULL,
             cursor INTEGER NOT NULL,
             state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'paused')),
             paused_reason TEXT,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at TEXT NOT NULL,
-            last_attempt_at TEXT,
-            last_success_at TEXT,
+            next_attempt_at REAL NOT NULL,
+            last_attempt_at REAL,
+            last_success_at REAL,
             last_error TEXT
         );
         ```
-    *   Add a `clock: Callable[[], datetime]` constructor parameter, defaulting to `lambda: datetime.now(UTC)`.
-        Keep the module-level `now()` for task timestamps, with its current format unchanged. Add
-        `stamp(dt) -> str`, which formats ISO-8601 UTC with milliseconds and a `Z` suffix, for event and
-        webhook times.
-    *   Add a private `_record(type: str, task: Task) -> None`. It builds the envelope from the "Envelope"
-        section, using `uuid.uuid4()`, and inserts it. It is called only inside an open transaction. `seq`
-        is unknown before the insert, so insert first with the body missing `seq`, then
-        `UPDATE events SET body = ? WHERE seq = ?` with the complete body, all in the same transaction.
-    *   `create`: after the INSERT, `_record("task.created", task)`.
-    *   `complete`: if the UPDATE's `rowcount == 1`, `_record("task.completed", task)`. The return value is
-        unchanged.
-    *   `delete`: read the task row first; if it exists, DELETE it and `_record("task.deleted", task)`. The
-        return value is unchanged.
-    *   Add `events_after(seq: int, limit: int = 100) -> list[dict]`, which returns parsed bodies ordered by
-        `seq`.
-    *   Add a `Webhook` dataclass with every column except `secret`, plus `lag: int`. Add
-        `create_webhook(url) -> tuple[Webhook, str]`, which returns the webhook and its secret; its cursor is
-        `COALESCE(MAX(seq), 0)` from `events`, and its `next_attempt_at` is now. Add `get_webhook(id)`,
-        `list_webhooks()`, `delete_webhook(id) -> bool`, `set_paused(id, reason: str | None)` (setting
-        `None` resumes and makes the endpoint due now), and `skip(id) -> bool`, which advances the cursor by
-        one event and resumes.
-    *   Delivery helpers, all short and run under the lock:
-        *   `next_due() -> tuple[int, str, str, str, int] | None`, which returns
-            `(webhook_id, url, secret, body, seq)` for the earliest-due active webhook with a pending event.
-        *   `delivered(webhook_id, seq)`.
-        *   `failed(webhook_id, error: str, retry_in: float)`.
-        *   `pause_for(webhook_id, reason: str)`.
+    *   Module constants:
+        *   `BACKOFF = (5, 15, 60, 300, 900, 1800)`
+        *   `OPERATOR_PAUSE = "paused by operator"`
+        *   `log = logging.getLogger("taskbox.webhooks")`
+    *   `class Conflict(Exception)` carries a message.
+    *   `@dataclass(frozen=True) class Webhook` has these fields: `id: int`, `url: str`,
+        `created_at: str`, `cursor: int`, `lag: int`, `state: str`, `paused_reason: str | None`,
+        `consecutive_failures: int`, `next_attempt_at: str`, `last_attempt_at: str | None`,
+        `last_success_at: str | None`, `last_error: str | None`. Times are rendered with `iso()`, and
+        `None` stays `None`. Add `to_dict()` using `asdict`. There is no `secret` field.
+    *   `@dataclass(frozen=True) class Due` has these fields: `webhook_id: int`, `url: str`,
+        `secret: str`, `cursor: int`, `failures: int`, `seq: int`, `event_id: str`, `body: str`.
+    *   Methods. Each takes `self.lock` itself.
 
-#### 2. `src/taskbox/webhooks.py` (Create) — Phase 2
+        | Method | Returns | Behaviour |
+        |---|---|---|
+        | `create_webhook(url: str)` | `tuple[Webhook, str]` | Creates the endpoint and returns it with its secret, `secrets.token_hex(32)`. `cursor = COALESCE(MAX(seq), 0)` from `events`. `next_attempt_at = created_at = self.clock()`. |
+        | `get_webhook(id: int)` | `Webhook \| None` | Returns the endpoint, with `lag = max(0, COALESCE(MAX(events.seq), 0) - cursor)`. |
+        | `list_webhooks()` | `list[Webhook]` | Returns all endpoints, ordered by `id`. |
+        | `delete_webhook(id: int)` | `bool` | Deletes the endpoint. |
+        | `pause(id: int)` | `Webhook \| None` | Sets `state = 'paused'`, `paused_reason = OPERATOR_PAUSE`. Logs WARNING `paused webhook=<id> reason=<reason>`. |
+        | `resume(id: int)` | `Webhook \| None` | Sets `state = 'active'`, `paused_reason = NULL`, `consecutive_failures = 0`, `next_attempt_at = clock()`, and keeps `last_error`. Logs WARNING `resumed webhook=<id>`. |
+        | `skip(id: int)` | `Webhook \| None` | Returns `None` if the endpoint is missing. Raises `Conflict("webhook is not paused")` unless `state == 'paused'`. Sets `cursor = (SELECT MIN(seq) FROM events WHERE seq > cursor)`, or raises `Conflict("no pending event")` if there is none. Then applies `resume`'s changes. Logs WARNING `skipped webhook=<id> seq=<n>`. |
+        | `next_due()` | `Due \| None` | `SELECT` from `webhooks` joined to the event with `MIN(seq) > cursor`, `WHERE state = 'active' AND next_attempt_at <= clock()`, `ORDER BY next_attempt_at, id LIMIT 1`. |
+        | `record_outcome(due: Due, outcome: str, error: str \| None)` | `bool` | One `UPDATE ... WHERE id = ? AND cursor = ? AND state = 'active'`, applying the Delivery step 3 fields for `outcome` (`"delivered"`, `"retry"` or `"pause"`) with `now = clock()` and `n = due.failures + 1`. Sets `last_attempt_at = now`. Returns whether a row matched. On `"pause"`, logs WARNING `paused webhook=<id> reason=<error>`. |
 
-*   **Type / Scope**: Python module: signing, sending, the worker.
+#### 2. `src/taskbox/webhooks.py` (Create, Phase 2)
+
+*   **Type / Scope**: Python module covering signing, sending, and the worker.
 *   **Proposed Changes**:
-    *   `BACKOFF = (5, 15, 60, 300, 900, 1800)`, plus
-        `backoff(failures: int) -> float = BACKOFF[min(failures, len(BACKOFF)) - 1]`.
-    *   `sign(secret: str, body: str, t: int) -> str` returns `f"t={t},v1={hmac_sha256_hex}"`.
-    *   `Outcome = Literal["delivered", "retry", "pause"]`, and
-        `classify(status: int | None) -> Outcome`:
-        *   2xx → `delivered`
-        *   `None` (network error), 408, 429, and 5xx → `retry`
-        *   everything else → `pause`
-    *   `send(url, body, headers, timeout=10.0) -> tuple[int | None, str]`. Uses `urllib.request` with an
-        opener whose redirect handler raises instead of following. Returns the status and, as a string,
-        the first 200 bytes of the response or the exception class name.
-    *   `class DeliveryWorker(store, *, sender=send, clock=time.time, sleep=threading.Event().wait)`:
-        *   `run_once() -> bool` performs steps 1–3 of the Delivery section and returns whether it attempted
-            anything.
-        *   `start()` runs a daemon thread looping `run_once`, sleeping up to 1 s whenever nothing was
-            attempted.
-        *   `stop()` sets the event and joins the thread.
-        *   `run_once` logs one INFO line per attempt and one WARNING line on pause.
-*   **URL validation**: `validate_url(url) -> str | None` returns an error message unless the URL is a
-    string of at most 2,000 characters whose scheme is `http` or `https` and which has a hostname.
+    *   `sign(secret: str, t: int, body: bytes) -> str` returns `f"t={t},v1={hexdigest}"`, using
+        `hmac.new(secret.encode("ascii"), f"{t}.".encode("ascii") + body, hashlib.sha256)`.
+    *   `classify(status: int | None) -> str` returns:
+        *   `"delivered"` for 200–299;
+        *   `"retry"` for `None`, 408, 429, or 500–599;
+        *   `"pause"` for anything else.
+    *   `class _NoRedirect(urllib.request.HTTPRedirectHandler)` has `redirect_request` return `None`, so
+        urllib raises `HTTPError` with the 3xx code. Build the opener once, with
+        `urllib.request.build_opener(_NoRedirect)`.
+    *   `send(url: str, body: bytes, headers: dict[str, str], timeout: float = 10.0) -> tuple[int | None, str]`
+        POSTs with that opener. It returns:
+        *   on success, `(resp.status, resp.read(200).decode("utf-8", "replace"))`;
+        *   on `except HTTPError as e`, `(e.code, e.read(200).decode("utf-8", "replace"))`;
+        *   on `except (URLError, OSError, TimeoutError) as e`, `(None, type(e).__name__)`.
+    *   `validate_url(url: object) -> str | None` returns `None` when the value is valid. Otherwise it
+        returns:
+        *   `"url must be a string"`;
+        *   `"url must be at most 2000 characters"`;
+        *   `"url must be an absolute http or https URL with a host"`. This one is for a scheme other than
+            http or https, or a missing hostname, as judged by `urlsplit`.
+    *   `class DeliveryWorker` has
+        `__init__(self, store, sender: Callable[[str, bytes, dict[str, str]], tuple[int | None, str]] = send)`
+        and `self._stop = threading.Event()`, `self._thread: threading.Thread | None = None`.
+        *   `run_once() -> bool` works as follows:
+            *   It calls `due = store.next_due()` and returns `False` if that is `None`.
+            *   It builds `body = json.dumps(envelope(due.seq, due.body), separators=(",", ":")).encode()`
+                and `t = int(store.clock())`.
+            *   It sends with these headers: `Content-Type: application/json`,
+                `Taskbox-Event-Id: due.event_id`, and `Taskbox-Signature: sign(due.secret, t, body)`.
+            *   It sets `outcome = classify(status)`. The error is `None` when the outcome is delivered.
+                Otherwise it is `f"HTTP {status}: {detail}"` if `status` is set, else `detail`.
+            *   It calls `store.record_outcome(due, outcome, error)` and logs the INFO attempt line.
+            *   It returns `True`.
+        *   `start()` starts a daemon thread running `_loop`. `_loop` repeats
+            `while not self._stop.is_set()`. Each pass does `try: busy = self.run_once()`. On
+            `except Exception`, it calls `log.exception("delivery loop error")` and sets `busy = False`.
+            When `busy` is false it calls `self._stop.wait(1.0)`.
+        *   `stop()` calls `self._stop.set()`, then joins the thread with a 15-second timeout.
 
-#### 3. `src/taskbox/server.py` (Modify) — Phases 1 and 2
+#### 3. `src/taskbox/server.py` (Modify)
 
 *   **Type / Scope**: HTTP routes.
-*   **Proposed Changes**: Split `self.path` into path and query with `urllib.parse.urlsplit` before
-    matching. Add routes:
-    *   Phase 1: `GET /events?after=<int>` (default 0) → `{"events": [...], "next_after": <last seq or the
-        given after>}`. A non-integer `after` → 400 `{"error": "after must be a non-negative integer"}`.
-    *   Phase 2:
-        *   `POST /webhooks {"url"}` → 201 with the webhook plus `"secret"`, or 400 with the validation message.
-        *   `GET /webhooks` → a list of webhooks without secrets.
-        *   `GET /webhooks/{id}` → the webhook, or 404.
-        *   `DELETE /webhooks/{id}` → 204 or 404.
-        *   `POST /webhooks/{id}/pause`, `/resume`, `/skip` → 200 with the webhook, or 404.
-    *   Routing uses a module-level `WEBHOOK_PATH = re.compile(r"^/webhooks/(\d+)(?:/(pause|resume|skip))?$")`.
-    *   `main()` gains `--no-webhooks`. Unless it is set, `main()` creates a `DeliveryWorker(store)` and
-        `start()`s it before `serve_forever`, then `stop()`s it on exit. It also calls
-        `logging.basicConfig(level=logging.INFO)`.
-    *   `make_server`'s signature is unchanged, and it does not start a worker.
-
-#### 4. `tests/test_events.py` (Create) — Phase 1
-
-*   **Type / Scope**: Unit tests on `Store` and `GET /events`.
 *   **Proposed Changes**:
-    *   Create, complete, and delete each record exactly one event with the right type and task snapshot.
-    *   A second `complete` and a delete of a missing task record none.
-    *   Ids are unique UUIDs, and `seq` increases.
-    *   The body of a `task.deleted` event carries the title.
-    *   `events_after` pages correctly.
-    *   A database file created with the version-1 schema migrates to version 2 and keeps its tasks.
-    *   The route returns 400 for `after=abc`.
-    *   `test_api.py` stays unchanged and passes.
+    *   The module docstring lists every route.
+    *   Each handler first checks `Host`:
+        *   The allowed values are `{f"127.0.0.1:{port}", f"localhost:{port}"}`, where
+            `port = self.server.server_address[1]`.
+        *   Anything else gets `421 {"error": "unexpected Host header"}`.
+    *   Each handler then splits `self.path` with `urllib.parse.urlsplit`. Routes match on `.path`, and
+        query parameters are read with `parse_qs(.query)`.
+    *   **Phase 1, `GET /events`**:
+        *   `after` defaults to `0`.
+        *   If present, its first value must match `^\d+$`, else
+            `400 {"error": "after must be a non-negative integer"}`.
+        *   It returns `200 {"events": [...], "next_after": <seq of last event, or after if none>}`.
+    *   **Phase 2**:
+        *   `WEBHOOK_PATH = re.compile(r"^/webhooks/(\d+)(?:/(pause|resume|skip))?$")`.
+        *   Any `POST` whose path starts with `/webhooks` needs `Content-Type` whose media type (before
+            `;`) is `application/json`, else `415 {"error": "Content-Type must be application/json"}`.
+        *   Routes:
+            *   `POST /webhooks` with body `{"url": <string>}`. A non-object body is
+                `400 "body must be a JSON object"`. A failure from `validate_url` is `400` with its
+                message. Success is `201`, returning `{**webhook.to_dict(), "secret": secret}`.
+            *   `GET /webhooks` returns `200 [webhook.to_dict(), ...]`, a bare list like `GET /tasks`.
+            *   `GET /webhooks/{id}` returns `200` with the webhook, or `404 "webhook not found"`.
+            *   `DELETE /webhooks/{id}` returns `204`, or `404`.
+            *   `POST /webhooks/{id}/pause`, `/resume`, and `/skip` return `200` with the webhook, or
+                `404`. A `Conflict` from `skip` is `409` with its message.
+    *   `main()`:
+        *   adds `--no-webhooks`;
+        *   calls `logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")`;
+        *   binds `store = Store(args.db)`;
+        *   unless `--no-webhooks` is set, creates `DeliveryWorker(store)` and calls `.start()`;
+        *   runs `serve_forever()` inside `try`, keeping the existing `KeyboardInterrupt` suppression,
+            with `finally:` calling `worker.stop()` if a worker exists, then `server.server_close()`.
+    *   `make_server`'s signature does not change, and it never starts a worker.
 
-#### 5. `tests/test_webhooks.py` (Create) — Phase 2
+#### 4. `tests/test_events.py` (Create, Phase 1)
 
-*   **Type / Scope**: Worker and route tests with a fake sender and a fake clock, plus one end-to-end test
-    against a real receiver on port 0.
+*   **Type / Scope**: Store and `GET /events` tests.
 *   **Proposed Changes**:
-    *   `classify` table.
-    *   A signature that a reference verifier accepts.
-    *   `backoff` values.
-    *   Delivery advances the cursor.
-    *   A 503 schedules a retry at now + 5 s and doesn't advance the cursor.
-    *   Three failures, then success, delivers in order.
-    *   A 400 pauses; `resume` retries the same event; `skip` moves past it.
-    *   A new webhook doesn't receive history.
-    *   `GET /webhooks/{id}` never contains `secret`; the creating `POST` does.
-    *   The worker never holds `store.lock` while the sender runs. The fake sender asserts that
-        `store.lock.locked()` is false.
-    *   Redirect responses are not followed.
-    *   End to end: register a receiver server, complete a task, run `run_once`, and the receiver gets a
-        request whose signature verifies.
+    *   Create, complete, and delete each record one event. The `type` matches, and the task in `data`
+        matches what the call returned.
+    *   A second `complete` records nothing, and neither does `delete` of a missing id.
+    *   `task.deleted` carries the deleted task's title.
+    *   Every `id` is a valid UUID, the ids are distinct, and `seq` strictly increases.
+    *   The stored body has no `seq`, while `events_after` output has `seq` as the second key.
+    *   `occurred_at` comes from the injected clock, for example `clock=lambda: 1_800_000_000.5` gives
+        `"2027-01-15T08:00:00.500Z"`.
+    *   `events_after(2, limit=2)` returns exactly the two events with the smallest `seq > 2`.
+    *   For the existing-database upgrade, build a file with raw `sqlite3` using today's `tasks` DDL and
+        insert a task. Open `Store(path)`, and the task is still there and the `events` table exists. Open
+        it a second time, and it still works.
+    *   Over HTTP:
+        *   `GET /events` returns events after mutations.
+        *   `?after=N` pages, and an empty page returns `next_after == N`.
+        *   `?after=abc` and `?after=-1` return `400`.
+        *   A request with `Host: evil.example` returns `421`.
 
-#### 6. `docs/webhooks.md` (Create) — Phase 2
+#### 5. `tests/test_webhooks.py` (Create, Phase 2)
 
-*   **Type / Scope**: Receiver documentation.
+*   **Type / Scope**: Worker, store, and route tests. They use a fake sender and a fake clock (`Store(":memory:",
+    clock=clock)` with a mutable `clock.now`), plus one end-to-end test against a real receiver on port 0.
+*   **Proposed Changes**: Tests for:
+    *   `classify`, table-driven over 200, 204, 299, 301, 302, 400, 401, 404, 408, 429, 500, 503, and `None`.
+    *   The signature: `sign` matches the reference verifier in `docs/webhooks.md`, which is reproduced in
+        the test.
+    *   Delivery: it advances the cursor and resets failures.
+    *   A 503 sets `next_attempt_at = now + 5`. The next five failures follow 15, 60, 300, 900, and 1800,
+        and later ones stay at 1800.
+    *   After three failures and then a success, events arrive in `seq` order.
+    *   A 400 pauses the endpoint, with `paused_reason` starting `"HTTP 400"`. `resume` retries the same
+        `seq`.
+    *   `skip` on a paused endpoint moves to the next existing `seq`, even when `seq` values have gaps.
+        `skip` on an active endpoint returns `409`.
+    *   Race: the fake sender calls `store.pause(id)` mid-send. `record_outcome` returns `False`, and the
+        endpoint stays paused with its cursor unchanged.
+    *   The fake sender asserts `not store.lock.locked()` on every call.
+    *   A sender that raises once doesn't stop the worker. Use `start()`, then wait on a delivered-event
+        condition, then `stop()`.
+    *   A new endpoint gets no history, and `lag` counts pending events.
+    *   `secret` appears in the `POST` response and never in `GET /webhooks` or `GET /webhooks/{id}`.
+        Captured logs contain no secret.
+    *   Routes:
+        *   list;
+        *   get with a 404;
+        *   delete, returning 204 and then 404;
+        *   pause, resume, and skip, each with a 404;
+        *   `415` without a JSON content type.
+    *   `validate_url` cases: `ftp://x`, `http://`, `/relative`, `5`, and a URL longer than 2000
+        characters.
+    *   The redirect, end to end: a receiver answers `302` to another local server. The endpoint pauses,
+        and the redirect target receives nothing.
+    *   End to end: a real receiver on port 0 gets a request whose signature verifies and whose body
+        envelope matches `GET /events`.
+
+#### 6. `docs/webhooks.md` (Create, Phase 2) and `scripts/receiver.py` (Create, Phase 2)
+
+*   **Type / Scope**: Receiver documentation, and a development receiver.
 *   **Proposed Changes**:
-    *   The envelope, the headers, and a 10-line Python signature verifier.
-    *   The delivery contract: at-least-once, de-duplicate on `id`, per-endpoint order by `seq`.
-    *   The retry schedule, and what pauses an endpoint.
+    *   `docs/webhooks.md` covers the envelope, the headers, the 12-line reference verifier, and the
+        delivery contract: at-least-once, de-duplicate on `id`, per-endpoint order by `seq`. It also
+        covers the retry schedule and what pauses an endpoint.
+    *   `scripts/receiver.py [--port 9000] [--secret S]` is a standard-library server. It answers every
+        POST with `204`, prints the event type, `id`, and `seq`, and checks the signature when `--secret`
+        is given.
 
 ### Verification Plan
 
-*   **Compilation/Build**: `uv sync --locked`
-*   **Unit Tests**: `uv run pytest -q` passes. The existing `tests/test_api.py` passes unchanged.
-*   **Static Analysis & Linting**: `uv run ruff check .` and `uv run ruff format --check .`
-*   **Test Coverage Requirement**: every outcome branch of `classify`, and every route listed in file 3.
-*   **E2E/Integration**: the end-to-end test in file 5, then a manual run:
-    1.  Start `taskbox`.
-    2.  Register `http://127.0.0.1:9000/` while nothing listens there.
-    3.  Complete a task and watch the retry log lines.
-    4.  Start a listener and see the event arrive.
+*   **Environment setup**: `uv sync --locked`
+*   **Unit tests**: `uv run pytest -q`. Every test named in files 4 and 5 must exist and pass, and
+    `tests/test_api.py` must pass unchanged.
+*   **Static analysis**: `uv run ruff check .` and `uv run ruff format --check .`
+*   **Manual end-to-end**:
+    1.  Start `uv run taskbox --db /tmp/tb.db`.
+    2.  Register `http://127.0.0.1:9000/` with
+        `curl -s -H 'Content-Type: application/json' -d '{"url":"http://127.0.0.1:9000/"}' localhost:8000/webhooks`.
+    3.  Complete a task. Expect INFO lines with `outcome=retry status=-` at about 5 s and then 15 s.
+    4.  Start `uv run python scripts/receiver.py --port 9000`. On the next retry it prints `task.completed`,
+        and the log shows `outcome=delivered`.
 
 --------------------------------------------------------------------------------
 
-<!-- Provenance: Indicates initial structural drafting via EGM. -->
+## Additional Resources
 
-*Drafted with EGM*
+*   [Concept brief](../egm-run/01-brainstorm/concepts_brief.md) and the six [brainstorm reports](../egm-run/01-brainstorm/goldfish/)
+*   [Consolidated review](../egm-run/03-review/consolidated_review_report.md) and its [raw reports](../egm-run/03-review/raw/)
+*   [`src/taskbox/store.py`](../../src/taskbox/store.py), [`src/taskbox/server.py`](../../src/taskbox/server.py), [`tests/test_api.py`](../../tests/test_api.py)
+
+## Future Improvements
+
+*   **Retention**: delete events that every endpoint has acknowledged and that are older than N days.
+*   **Schema versioning**: introduce `PRAGMA user_version` the first time a column must change.
+*   **Rotation**: two live secrets per endpoint, with a signature for each.
+*   **Parallel delivery**, if more than about five endpoints are registered.
+
+## Resolution History
+
+*   **Revision 1** (commit `df48a8a`), reviewed by nine fresh reviewers across five stages, raised 5
+    Blockers and 61 Majors before de-duplication.
+*   **Revision 2** applies [the resolution](../egm-run/04-resolve/goldfish_review_report.md):
+    *   21 fixes;
+    *   1 narrowed fix (the `Host` and Content-Type checks);
+    *   reviewer proposals declined in favour of cheaper fixes: `stream_id`, the worker heartbeat, an
+        overall deadline, and the receiver allowlist.
+
+*Drafted with EGM.*
